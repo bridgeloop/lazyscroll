@@ -1,0 +1,351 @@
+<body>
+<style>
+	body {
+		margin: 0;
+		height: 100dvh;
+	}
+
+	button {
+		background: bisque;
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		align-items: center;
+		position: absolute;
+		height: var(--row-height);
+		width: var(--column-width);
+	}
+
+	button:focus {
+		background: white;
+	}
+</style>
+<script>
+	function mod(n, d) {
+		return ((n % d) + d) % d;
+	}
+
+	function clamp(n, min, max) {
+		return (min > max) ? undefined :
+			((n < min) ? min :
+					((n > max) ? max : n)
+			);
+	}
+
+	// slow data source
+	const dataSource = {
+		async index(idx) {
+			await new Promise(res => setTimeout(res, 500 + Math.random() * 750));
+			return idx;
+		},
+		async length() {
+			return 100;
+		},
+	}
+	
+	const scroller = {
+		dataSource: null,
+
+		scrollContainer: null,
+
+		rowHeight: null,
+		columns: 1,
+
+		elementsPerViewport: 0,
+		elementsAboveViewport: 0,
+		elementsBelowViewport: 0,
+		scrollInterval: null,
+
+		obs: null,
+		elements: [],
+		elementsBase: 0,
+
+		_prevIntervalAligned: null,
+		prevIntervalAligned(current) {
+			const capture = this._prevIntervalAligned;
+			this._prevIntervalAligned = current;
+			return capture;
+		},
+		_prevAdjustedIdx: null,
+
+		loadElements(firstSourceIdx, firstAvailableElement, nElements) {
+			const elements = this.elements;
+			const totalElements = this.elements.length;
+			const elementsBase = this.elementsBase;
+			const rowHeight = this.rowHeight;
+			const columns = this.columns;
+
+			// elementsBase is fine here since this function doesn't await
+
+			for (let idx = 0; idx < nElements; ++idx) {
+				const elIdx = (elementsBase + firstAvailableElement + idx) % totalElements;
+				const obj = elements[elIdx];
+				const {element} = obj;
+				const sourceIdx = firstSourceIdx + idx;
+
+				element.style.transform = `
+						translateY(${((sourceIdx / columns) | 0) * rowHeight}px)
+						translateX(calc(var(--column-width) * ${sourceIdx % columns}))
+					`;
+
+				if (obj.loadRequest) {
+					obj.loadRequest.aborted = true;
+				}
+				let loadRequest = {aborted: false};
+				obj.loadRequest = loadRequest;
+
+				element.tabIndex = sourceIdx + 1;
+				element.innerText = "loading!";
+
+				dataSource.index(sourceIdx).then(value => {
+					if (!loadRequest.aborted) {
+						obj.sourceIdx = sourceIdx;
+						element.innerText = value;
+					}
+				});
+			}
+			return;
+		},
+
+		// requires:
+		// I dataSource.length
+		// I scrollContainer
+		// I rowHeight
+		// S columns
+		// S scrollInterval
+		// S elementsAboveViewport
+		// S elementsPerViewport
+		// S elementsBelowViewport
+		adjustedIdx(maxSourceIdx, scrollRow) {
+			const topSourceIdx = scrollRow * this.columns;
+			const adjustedIdx = clamp(topSourceIdx, this.elementsAboveViewport, maxSourceIdx - this.elementsBelowViewport);
+
+			const prevAdjustedIdx = this._prevAdjustedIdx;
+			if (adjustedIdx !== undefined) {
+				this._prevAdjustedIdx = adjustedIdx;
+			}
+
+			return {adjustedIdx, prevAdjustedIdx};
+		},
+		scrollRow(scrollPos) {
+			return (scrollPos / this.rowHeight) | 0;
+		},
+		intervalAligned(scrollPos) {
+			return scrollPos - (scrollPos % this.scrollInterval);
+		},
+		scrollPos() {
+			const maxSourceIdx = this.dataSource.length - this.elementsPerViewport;
+			const scrollPos = Math.min(
+				this.scrollContainer.scrollTop,
+				maxSourceIdx * this.rowHeight
+			);
+
+			return {maxSourceIdx, scrollPos};
+		},
+
+		scroll(adjustedIdx, offset) {
+			const scrollingUp = +(offset > 0);
+			const scrollingDown = +(offset < 0);
+
+			const els = this.elements.length;
+
+			// amount of elements that we have to update
+			const freeElements = Math.min(Math.abs(offset), els);
+			// index of first available element relative to elementsBase
+			const firstAvailableElement = scrollingUp * (els - freeElements);
+
+			const firstSourceIdx = adjustedIdx - this.elementsAboveViewport + (scrollingDown * (els - freeElements));
+
+			console.log("firstSourceIdx", firstSourceIdx, "firstAvailableElement", firstAvailableElement, "freeElements", freeElements);
+			this.loadElements(firstSourceIdx, firstAvailableElement, freeElements);
+			this.elementsBase = mod(this.elementsBase - clamp(offset, -els, els), els);
+
+			return;
+		},
+
+		callback() {
+			// not first run (first run is handled by `size` now)
+
+			console.log("callback");
+
+			const {maxSourceIdx, scrollPos} = this.scrollPos();
+
+			// this is simply for the sake of aborting if the interval was not crossed
+			const intervalAligned = this.intervalAligned(scrollPos);
+			const prevIntervalAligned = this.prevIntervalAligned(intervalAligned);
+
+			if (prevIntervalAligned === intervalAligned) {
+				// not scrolled past interval; abort
+				console.log("aborted");
+				return;
+			}
+
+			const scrollRow = this.scrollRow(scrollPos);
+			const {adjustedIdx, prevAdjustedIdx} = this.adjustedIdx(maxSourceIdx, scrollRow);
+
+			// positive : scroll up
+			// negative : scroll down
+			const offset = prevAdjustedIdx - adjustedIdx;
+			this.scroll(adjustedIdx, offset);
+
+			// fix scrolling fast
+			return requestAnimationFrame(_ => this.callback());
+		},
+
+		size(conf) {
+			let newElement = () => {
+				const element = document.createElement("button");
+				conf.parent.append(element);
+				this.obs.observe(element);
+				return {
+					element, loadRequest: null,
+				}
+			}
+
+			const oldColumns = this.columns;
+			const oldAbove = this.elementsAboveViewport;
+
+			this.columns = conf.columns;
+			this.scrollInterval = conf.rowInterval * this.columns;
+			this.elementsAboveViewport = conf.rowsAboveViewport * this.columns;
+			this.elementsPerViewport = Math.ceil(conf.viewportHeight / this.rowHeight) * this.columns;
+			this.elementsBelowViewport = conf.rowsBelowViewport * this.columns;
+			this.scrollContainer.style.height = Math.ceil(this.dataSource.length / this.columns) * this.rowHeight + "px";
+
+			const {maxSourceIdx, scrollPos} = this.scrollPos();
+			this.prevIntervalAligned(this.intervalAligned(scrollPos));
+			const scrollRow = this.scrollRow(scrollPos);
+
+			let {adjustedIdx, prevAdjustedIdx} = this.adjustedIdx(maxSourceIdx, scrollRow);
+
+			let prevStart = prevAdjustedIdx - oldAbove;
+			let prevEnd = prevStart + this.elements.length;
+
+			let currStart = adjustedIdx - this.elementsAboveViewport;
+			let currEnd = adjustedIdx + this.elementsPerViewport + this.elementsBelowViewport;
+
+			let finalLen = currEnd - currStart;
+
+			if (adjustedIdx === undefined) {
+				adjustedIdx = this.elementsAboveViewport;
+				currStart = 0;
+				finalLen = this.dataSource.length;
+				currEnd = finalLen;
+
+				this._prevAdjustedIdx = adjustedIdx;
+				this.obs.disconnect();
+			}
+
+			//console.log("prevStart", prevStart, "prevEnd", prevEnd);
+			//console.log("currStart", currStart, "currEnd", currEnd);
+
+			const elements = [...this.elements.splice(this.elementsBase), ...this.elements];
+
+			const toRemoveFromLeft = clamp(currStart - prevStart, -finalLen, elements.length);
+			const toRemoveFromRight = clamp(prevEnd - currEnd, -finalLen, elements.length);
+
+			//console.log("toRemoveFromLeft", toRemoveFromLeft, "toRemoveFromRight", toRemoveFromRight);
+
+			const leftRemoved = elements.splice(0, Math.max(toRemoveFromLeft, 0));
+			const rightRemoved = elements.splice(elements.length - toRemoveFromRight, Math.max(toRemoveFromRight, 0));
+
+			if (this.columns != oldColumns) {
+				let it = 0;
+				for (const {element} of elements) {
+					const sourceIdx =
+						adjustedIdx - this.elementsAboveViewport + -toRemoveFromLeft + it;
+					element.style.transform = `
+							translateY(${((sourceIdx / this.columns) | 0) * rowHeight}px)
+							translateX(calc(var(--column-width) * ${sourceIdx % this.columns}))
+						`;
+					it += 1;
+				}
+			}
+
+			const marker1 = 0;
+			const len1 = Math.max(0, -toRemoveFromLeft);
+			for (let idx = 0; idx < -toRemoveFromLeft; ++idx) {
+				// take from right side
+				let obj = rightRemoved.splice(0, 1)[0];
+				// or create
+				obj ??= newElement();
+				elements.unshift(obj);
+			}
+
+			const marker2 = elements.length;
+			const len2 = finalLen - marker2;
+			for (let idx = 0; idx < -toRemoveFromRight; ++idx) {
+				// take from left side
+				let obj = leftRemoved.splice(0, 1)[0];
+				// or create
+				obj ??= newElement();
+				elements.push(obj);
+			}
+
+			for (const {element} of [...leftRemoved, ...rightRemoved]) {
+				element.remove();
+				this.obs.unobserve(element);
+			}
+
+			this.elements = elements;
+			this.elementsBase = 0;
+
+			this.loadElements(
+				adjustedIdx - this.elementsAboveViewport,
+				marker1,
+				len1,
+			);
+			this.loadElements(
+				adjustedIdx - this.elementsAboveViewport + marker2,
+				marker2,
+				len2,
+			);
+
+			this.prevIntervalAligned(this.intervalAligned(scrollPos));
+
+			return;
+		},
+		async init(conf) {
+			this.obs = new IntersectionObserver(_ => this.callback());
+
+			this.dataSource = {
+				index: conf.dataSource.index.bind(conf.dataSource),
+				length: await conf.dataSource.length(),
+			}
+
+			this.scrollContainer = conf.scrollContainer;
+			this.rowHeight = conf.rowHeight;
+		},
+	}
+
+	const rowHeight = 100;
+	scroller.init({
+		dataSource,
+		scrollContainer: document.body,
+		rowHeight,
+	});
+
+	let columns = 1;
+	const columnWidth = window.innerWidth / columns;
+	document.documentElement.style.setProperty("--row-height", rowHeight);
+
+	function resize() {
+		document.documentElement.style.setProperty("--column-width", `calc(100dvw / ${columns})`);
+		scroller.size({
+			parent: document.body,
+
+			viewportHeight: window.innerHeight,
+			columns,
+
+			rowsAboveViewport: 2,
+			rowsBelowViewport: 2,
+			rowInterval: 1,
+		});
+	}
+
+	window.onresize = resize;
+
+	// chrome resets the scroll position on conf.parent.append without RAF
+	requestAnimationFrame(resize);
+</script>
+</body>
